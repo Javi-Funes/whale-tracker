@@ -1,576 +1,673 @@
 # =============================================================
-# WHALE TRACKER — setup_console.py
-# Consola interactiva para configurar tickers y parámetros.
-# Corre esto UNA VEZ antes de lanzar el tracker.
-# Guarda todo en config.py automáticamente.
-# =============================================================
-# CÓMO USARLO:
-#   python setup_console.py
+# WHALE TRACKER — whale_engine.py
+# Motor de cálculo: descarga datos y calcula todos los
+# indicadores SMC + Order Flow automáticamente.
 # =============================================================
 
-import json
-import os
-import sys
+import yfinance as yf
+import pandas as pd
+import numpy as np
 from datetime import datetime
 
-# Colores para Windows (colorama) con fallback si no está instalado
-try:
-    from colorama import init, Fore, Back, Style
-    init(autoreset=True)
-    C_TITLE   = Fore.CYAN + Style.BRIGHT
-    C_OK      = Fore.GREEN + Style.BRIGHT
-    C_WARN    = Fore.YELLOW + Style.BRIGHT
-    C_ERR     = Fore.RED + Style.BRIGHT
-    C_DIM     = Fore.WHITE + Style.DIM
-    C_BOLD    = Style.BRIGHT
-    C_RESET   = Style.RESET_ALL
-    C_WHALE   = Fore.CYAN + Style.BRIGHT
-    C_SCORE   = Fore.GREEN
-    C_HEADER  = Fore.BLUE + Style.BRIGHT
-except ImportError:
-    C_TITLE = C_OK = C_WARN = C_ERR = C_DIM = C_BOLD = C_RESET = C_WHALE = C_SCORE = C_HEADER = ""
-
 # =============================================================
-# TICKERS SUGERIDOS POR CATEGORÍA
-# =============================================================
-SUGGESTED = {
-    "🏦 Bancos ARG (ADR)": {
-        "GGAL": "Grupo Financiero Galicia",
-        "BBAR": "BBVA Argentina",
-        "BMA":  "Banco Macro",
-        "SUPV": "Supervielle",
-    },
-    "⚡ Energía ARG (ADR)": {
-        "YPF":  "YPF S.A.",
-        "PAM":  "Pampa Energía",
-        "CEPU": "Central Puerto",
-        "TGS":  "Transportadora Gas Sur",
-    },
-    "🏗 Otros ARG (ADR)": {
-        "LOMA": "Loma Negra",
-        "IRS":  "IRSA",
-        "CRESY":"Cresud",
-        "CAAP": "Corporación América Airports",
-    },
-    "💻 Tech / Global": {
-        "GLOB": "Globant",
-        "MELI": "MercadoLibre",
-        "AAPL": "Apple",
-        "TSLA": "Tesla",
-        "SPY":  "S&P 500 ETF",
-        "QQQ":  "Nasdaq ETF",
-    },
-}
-
-TIMEFRAMES = {
-    "1":  ("1m",  "1 minuto   — Scalping extremo"),
-    "2":  ("5m",  "5 minutos  — Scalping / day trading"),
-    "3":  ("15m", "15 minutos — Day trading"),
-    "4":  ("1h",  "1 hora     — Swing trading (RECOMENDADO para SMC)"),
-    "5":  ("4h",  "4 horas    — Swing / posicional"),
-    "6":  ("1d",  "Diario     — Posicional / largo plazo"),
-}
-
-PERIODS = {
-    "1": ("5d",  "5 días"),
-    "2": ("1mo", "1 mes"),
-    "3": ("3mo", "3 meses  (RECOMENDADO)"),
-    "4": ("6mo", "6 meses"),
-    "5": ("1y",  "1 año"),
-}
-
-# =============================================================
-# HELPERS DE DISPLAY
+# CLASE PRINCIPAL DEL ENGINE
 # =============================================================
 
-def clear():
-    os.system("cls" if os.name == "nt" else "clear")
+class WhaleEngine:
+    """
+    Descarga datos de yfinance y calcula:
+      - CVD (Cumulative Volume Delta) y divergencias
+      - Order Blocks alcistas y bajistas
+      - FVG (Fair Value Gaps / Imbalances)
+      - Stop Hunts (barridas de liquidez)
+      - MSS (Market Structure Shifts)
+      - Score de confluencia total (0-13)
+    """
 
-def header():
-    print(C_WHALE + """
-╔══════════════════════════════════════════════════════════╗
-║         🐋  WHALE TRACKER — Setup Console  🐋           ║
-║     Configurá tus activos sin tocar ningún archivo       ║
-╚══════════════════════════════════════════════════════════╝""" + C_RESET)
+    def __init__(self, ticker: str, timeframe: str, period: str, params: dict):
+        self.ticker    = ticker.upper()
+        self.timeframe = timeframe
+        self.period    = period
+        self.params    = params
+        self.df        = None       # DataFrame con datos + indicadores
+        self.signals   = {}         # Señales de la última vela
+        self.score     = 0          # Score total
+        self.status    = "WAITING"  # WAITING / WATCH / SETUP / ENTRY
+        self.last_update = None
 
-def divider(title=""):
-    if title:
-        print(C_DIM + f"\n{'─' * 20} {title} {'─' * 20}" + C_RESET)
-    else:
-        print(C_DIM + "─" * 58 + C_RESET)
+    # ----------------------------------------------------------
+    # DESCARGA DE DATOS
+    # ----------------------------------------------------------
 
-def ok(msg):    print(C_OK   + f"  ✓  {msg}" + C_RESET)
-def warn(msg):  print(C_WARN + f"  ⚠  {msg}" + C_RESET)
-def err(msg):   print(C_ERR  + f"  ✗  {msg}" + C_RESET)
-def info(msg):  print(C_DIM  + f"     {msg}" + C_RESET)
-
-def score_bar(score, total=13):
-    filled = int((score / total) * 20)
-    bar = "█" * filled + "░" * (20 - filled)
-    pct = int(score / total * 100)
-    if pct >= 75: color = C_OK
-    elif pct >= 50: color = C_WARN
-    else: color = C_DIM
-    return color + f"[{bar}] {pct}%" + C_RESET
-
-def input_prompt(msg):
-    return input(C_BOLD + f"\n  › {msg}: " + C_RESET).strip()
-
-def wait():
-    input(C_DIM + "\n  Presioná ENTER para continuar..." + C_RESET)
-
-# =============================================================
-# ESTADO DE LA SESIÓN
-# =============================================================
-session = {
-    "tickers":          [],
-    "timeframe":        "1h",
-    "period":           "3mo",
-    "signal_threshold": 8,
-    "warn_threshold":   6,
-    "update_interval":  60,
-    "sound":            False,
-    "log_file":         True,
-    "dashboard_port":   8050,
-    "dashboard_candles": 120,
-}
-
-# Cargar config existente si hay
-def load_existing():
-    if os.path.exists("config.py"):
+    def fetch(self) -> bool:
+        """Descarga datos OHLCV de yfinance. Retorna True si ok."""
         try:
-            # Leer tickers de la config existente
-            with open("config.py", "r") as f:
-                content = f.read()
-            # Buscar línea TICKERS en el archivo guardado por nosotros
-            if "# WHALE_TRACKER_CONFIG_JSON" in content:
-                start = content.find("# WHALE_TRACKER_CONFIG_JSON\n# ") + len("# WHALE_TRACKER_CONFIG_JSON\n# ")
-                end   = content.find("\n", start)
-                data  = json.loads(content[start:end])
-                session.update(data)
-                return True
-        except Exception:
-            pass
-    return False
+            ticker_obj = yf.Ticker(self.ticker)
+            df = ticker_obj.history(
+                period=self.period,
+                interval=self.timeframe,
+                auto_adjust=True,
+                prepost=False,
+            )
+            if df.empty or len(df) < 30:
+                return False
 
-# =============================================================
-# MENÚ PRINCIPAL
-# =============================================================
-def main_menu():
-    while True:
-        clear()
-        header()
+            df.index = pd.to_datetime(df.index)
+            df.columns = [c.lower() for c in df.columns]
+            df = df[["open", "high", "low", "close", "volume"]].copy()
+            df.dropna(inplace=True)
+            self.df = df
+            self.last_update = datetime.now()
+            return True
 
-        # Status actual
-        divider("Configuración actual")
-        if session["tickers"]:
-            print(C_BOLD + f"\n  Tickers ({len(session['tickers'])}/10):" + C_RESET)
-            for i, t in enumerate(session["tickers"], 1):
-                print(f"    {C_SCORE}{i:2}. {t:<8}{C_RESET}")
+        except Exception as e:
+            print(f"  [ERROR] {self.ticker} fetch: {e}")
+            return False
+
+    # ----------------------------------------------------------
+    # MÓDULO 1: ORDER FLOW — CVD
+    # ----------------------------------------------------------
+
+    def calc_cvd(self):
+        """
+        CVD = Cumulative Volume Delta
+        Aproximación: velas alcistas suman volumen, bajistas restan.
+        Divergencia: precio baja pero CVD sube → acumulación institucional.
+        """
+        df = self.df
+        n  = self.params.get("cvd_length", 20)
+
+        # Delta por vela
+        df["bull_vol"] = np.where(df["close"] > df["open"], df["volume"],
+                         np.where(df["close"] == df["open"], df["volume"] * 0.5, 0.0))
+        df["bear_vol"] = np.where(df["close"] < df["open"], df["volume"],
+                         np.where(df["close"] == df["open"], df["volume"] * 0.5, 0.0))
+        df["delta"]    = df["bull_vol"] - df["bear_vol"]
+
+        # CVD suavizado (media móvil del delta)
+        df["cvd"]      = df["delta"].rolling(n).mean()
+
+        # Tendencia precio y CVD en ventana n
+        df["price_trend"] = df["close"].rolling(n).mean()
+        df["cvd_trend"]   = df["cvd"].rolling(3).mean()
+
+        # Divergencia alcista: precio baja pero CVD sube
+        price_falling = df["price_trend"] < df["price_trend"].shift(3)
+        cvd_rising    = df["cvd_trend"]   > df["cvd_trend"].shift(3)
+        df["cvd_div_bull"] = price_falling & cvd_rising
+
+        # Divergencia bajista: precio sube pero CVD baja
+        price_rising   = df["price_trend"] > df["price_trend"].shift(3)
+        cvd_falling    = df["cvd_trend"]   < df["cvd_trend"].shift(3)
+        df["cvd_div_bear"] = price_rising & cvd_falling
+
+        # Volumen alto
+        vol_mult = self.params.get("vol_multiplier", 1.5)
+        vol_len  = self.params.get("vol_length", 20)
+        df["avg_vol"]   = df["volume"].rolling(vol_len).mean()
+        df["high_vol"]  = df["volume"] > df["avg_vol"] * vol_mult
+
+        # Absorción: wick largo con volumen alto
+        df["body"]      = (df["close"] - df["open"]).abs()
+        df["wick_low"]  = df[["open", "close"]].min(axis=1) - df["low"]
+        df["wick_high"] = df["high"] - df[["open", "close"]].max(axis=1)
+        wick_ratio      = self.params.get("sweep_wick_ratio", 2.0)
+        df["absorption_bull"] = (df["wick_low"]  > df["body"] * wick_ratio) & df["high_vol"]
+        df["absorption_bear"] = (df["wick_high"] > df["body"] * wick_ratio) & df["high_vol"]
+
+        self.df = df
+
+    # ----------------------------------------------------------
+    # MÓDULO 2: ORDER BLOCKS
+    # ----------------------------------------------------------
+
+    def calc_order_blocks(self):
+        """
+        OB alcista: última vela bajista antes de impulso alcista fuerte.
+        OB bajista: última vela alcista antes de impulso bajista fuerte.
+        Precio dentro del OB = zona institucional activa.
+        """
+        df  = self.df
+        n   = self.params.get("ob_length", 5)
+        mit = self.params.get("ob_mitigation", 0.5)
+
+        ob_bull_top    = []
+        ob_bull_bottom = []
+        ob_bear_top    = []
+        ob_bear_bottom = []
+        in_bull_ob     = []
+        in_bear_ob     = []
+        new_bull_ob    = []
+        new_bear_ob    = []
+
+        last_bull_top = last_bull_bot = np.nan
+        last_bear_top = last_bear_bot = np.nan
+
+        for i in range(len(df)):
+            if i < n + 1:
+                ob_bull_top.append(np.nan)
+                ob_bull_bottom.append(np.nan)
+                ob_bear_top.append(np.nan)
+                ob_bear_bottom.append(np.nan)
+                in_bull_ob.append(False)
+                in_bear_ob.append(False)
+                new_bull_ob.append(False)
+                new_bear_ob.append(False)
+                continue
+
+            row   = df.iloc[i]
+            prev  = df.iloc[i - n]
+
+            # OB alcista: vela n periodos atrás era bajista y ahora rompemos su máximo
+            if prev["close"] < prev["open"] and row["close"] > prev["high"]:
+                last_bull_top = prev["high"]
+                last_bull_bot = prev["low"]
+                new_bull_ob.append(True)
+            else:
+                new_bull_ob.append(False)
+
+            # OB bajista: vela n periodos atrás era alcista y ahora rompemos su mínimo
+            if prev["close"] > prev["open"] and row["close"] < prev["low"]:
+                last_bear_top = prev["high"]
+                last_bear_bot = prev["low"]
+                new_bear_ob.append(True)
+            else:
+                new_bear_ob.append(False)
+
+            # Invalidar OB si precio lo penetra más del % de mitigación
+            if not np.isnan(last_bull_top):
+                ob_range   = last_bull_top - last_bull_bot
+                mitig_line = last_bull_top - ob_range * mit
+                if row["close"] < mitig_line:
+                    last_bull_top = last_bull_bot = np.nan
+
+            if not np.isnan(last_bear_top):
+                ob_range   = last_bear_top - last_bear_bot
+                mitig_line = last_bear_bot + ob_range * mit
+                if row["close"] > mitig_line:
+                    last_bear_top = last_bear_bot = np.nan
+
+            ob_bull_top.append(last_bull_top)
+            ob_bull_bottom.append(last_bull_bot)
+            ob_bear_top.append(last_bear_top)
+            ob_bear_bottom.append(last_bear_bot)
+
+            # ¿Precio tocando/dentro del OB alcista?
+            if not np.isnan(last_bull_top):
+                price = row["close"]
+                in_bull_ob.append(last_bull_bot <= price <= last_bull_top * 1.005)
+            else:
+                in_bull_ob.append(False)
+
+            if not np.isnan(last_bear_top):
+                price = row["close"]
+                in_bear_ob.append(last_bear_bot * 0.995 <= price <= last_bear_top)
+            else:
+                in_bear_ob.append(False)
+
+        df["ob_bull_top"]    = ob_bull_top
+        df["ob_bull_bottom"] = ob_bull_bottom
+        df["ob_bear_top"]    = ob_bear_top
+        df["ob_bear_bottom"] = ob_bear_bottom
+        df["in_bull_ob"]     = in_bull_ob
+        df["in_bear_ob"]     = in_bear_ob
+        df["new_bull_ob"]    = new_bull_ob
+        df["new_bear_ob"]    = new_bear_ob
+
+        self.df = df
+
+    # ----------------------------------------------------------
+    # MÓDULO 3: FAIR VALUE GAPS (FVG)
+    # ----------------------------------------------------------
+
+    def calc_fvg(self):
+        """
+        FVG alcista: gap entre high[i-2] y low[i] — precio se movió
+        tan rápido que dejó un hueco sin negociación.
+        Esos huecos actúan como imanes de precio.
+        """
+        df        = self.df
+        min_pct   = self.params.get("fvg_min_pct", 0.2) / 100
+
+        fvg_bull      = []
+        fvg_bear      = []
+        in_fvg_bull   = []
+        in_fvg_bear   = []
+        fvg_bull_top  = []
+        fvg_bull_bot  = []
+        fvg_bear_top  = []
+        fvg_bear_bot  = []
+
+        last_fvg_bull_top = last_fvg_bull_bot = np.nan
+        last_fvg_bear_top = last_fvg_bear_bot = np.nan
+
+        for i in range(len(df)):
+            if i < 2:
+                fvg_bull.append(False); fvg_bear.append(False)
+                in_fvg_bull.append(False); in_fvg_bear.append(False)
+                fvg_bull_top.append(np.nan); fvg_bull_bot.append(np.nan)
+                fvg_bear_top.append(np.nan); fvg_bear_bot.append(np.nan)
+                continue
+
+            curr = df.iloc[i]
+            prev2 = df.iloc[i - 2]
+            threshold = curr["close"] * min_pct
+
+            # FVG alcista: low actual > high de hace 2 velas
+            is_fvg_bull = curr["low"] > prev2["high"] + threshold
+            # FVG bajista: high actual < low de hace 2 velas
+            is_fvg_bear = curr["high"] < prev2["low"] - threshold
+
+            if is_fvg_bull:
+                last_fvg_bull_top = curr["low"]
+                last_fvg_bull_bot = prev2["high"]
+
+            if is_fvg_bear:
+                last_fvg_bear_top = prev2["low"]
+                last_fvg_bear_bot = curr["high"]
+
+            # Invalidar si precio lo rellena
+            if not np.isnan(last_fvg_bull_top) and curr["close"] < last_fvg_bull_bot:
+                last_fvg_bull_top = last_fvg_bull_bot = np.nan
+            if not np.isnan(last_fvg_bear_top) and curr["close"] > last_fvg_bear_top:
+                last_fvg_bear_top = last_fvg_bear_bot = np.nan
+
+            fvg_bull.append(is_fvg_bull)
+            fvg_bear.append(is_fvg_bear)
+            fvg_bull_top.append(last_fvg_bull_top)
+            fvg_bull_bot.append(last_fvg_bull_bot)
+            fvg_bear_top.append(last_fvg_bear_top)
+            fvg_bear_bot.append(last_fvg_bear_bot)
+
+            # ¿Precio en zona FVG?
+            p = curr["close"]
+            in_fvg_bull.append(
+                not np.isnan(last_fvg_bull_top) and last_fvg_bull_bot <= p <= last_fvg_bull_top
+            )
+            in_fvg_bear.append(
+                not np.isnan(last_fvg_bear_top) and last_fvg_bear_bot <= p <= last_fvg_bear_top
+            )
+
+        df["fvg_bull"]      = fvg_bull
+        df["fvg_bear"]      = fvg_bear
+        df["in_fvg_bull"]   = in_fvg_bull
+        df["in_fvg_bear"]   = in_fvg_bear
+        df["fvg_bull_top"]  = fvg_bull_top
+        df["fvg_bull_bot"]  = fvg_bull_bot
+        df["fvg_bear_top"]  = fvg_bear_top
+        df["fvg_bear_bot"]  = fvg_bear_bot
+
+        self.df = df
+
+    # ----------------------------------------------------------
+    # MÓDULO 4: STOP HUNTS (barridas de liquidez)
+    # ----------------------------------------------------------
+
+    def calc_stop_hunts(self):
+        """
+        Stop hunt alcista: precio cae bajo mínimos previos con wick largo
+        pero cierra arriba → trampa institucional, posible reversión.
+        """
+        df       = self.df
+        lookback = self.params.get("sweep_lookback", 20)
+
+        sh_bull = []
+        sh_bear = []
+
+        for i in range(len(df)):
+            if i < lookback:
+                sh_bull.append(False)
+                sh_bear.append(False)
+                continue
+
+            row       = df.iloc[i]
+            prev_low  = df["low"].iloc[i - lookback:i].min()
+            prev_high = df["high"].iloc[i - lookback:i].max()
+            high_vol  = row["high_vol"] if "high_vol" in df.columns else False
+
+            # Stop hunt alcista: wick barre mínimos previos pero cierra arriba
+            bull = (row["low"] < prev_low) and (row["close"] > prev_low) and high_vol
+            # Stop hunt bajista: wick barre máximos previos pero cierra abajo
+            bear = (row["high"] > prev_high) and (row["close"] < prev_high) and high_vol
+
+            sh_bull.append(bool(bull))
+            sh_bear.append(bool(bear))
+
+        df["stop_hunt_bull"] = sh_bull
+        df["stop_hunt_bear"] = sh_bear
+        self.df = df
+
+    # ----------------------------------------------------------
+    # MÓDULO 5: MARKET STRUCTURE SHIFT (MSS)
+    # ----------------------------------------------------------
+
+    def calc_mss(self):
+        """
+        MSS alcista: precio cierra por encima del último swing high.
+        Indica que la estructura cambió de bajista a alcista.
+        Es el trigger de entry más fiable en SMC.
+        """
+        df  = self.df
+        n   = self.params.get("swing_length", 5)
+
+        swing_highs = []
+        swing_lows  = []
+        mss_bull    = []
+        mss_bear    = []
+        last_sh     = np.nan
+        last_sl     = np.nan
+
+        for i in range(len(df)):
+            # Detectar pivot high/low (precio más alto/bajo en ventana n)
+            if i >= n * 2:
+                window_h = df["high"].iloc[i - n * 2:i]
+                window_l = df["low"].iloc[i - n * 2:i]
+                mid_h    = df["high"].iloc[i - n]
+                mid_l    = df["low"].iloc[i - n]
+
+                if mid_h == window_h.max():
+                    last_sh = mid_h
+                if mid_l == window_l.min():
+                    last_sl = mid_l
+
+            swing_highs.append(last_sh)
+            swing_lows.append(last_sl)
+
+            if i == 0:
+                mss_bull.append(False)
+                mss_bear.append(False)
+                continue
+
+            row  = df.iloc[i]
+            prev = df.iloc[i - 1]
+
+            # MSS alcista: cierre cruza swing high por primera vez
+            bull = (not np.isnan(last_sh) and
+                    row["close"] > last_sh and
+                    prev["close"] <= last_sh)
+
+            # MSS bajista: cierre cruza swing low por primera vez
+            bear = (not np.isnan(last_sl) and
+                    row["close"] < last_sl and
+                    prev["close"] >= last_sl)
+
+            mss_bull.append(bool(bull))
+            mss_bear.append(bool(bear))
+
+        df["swing_high"] = swing_highs
+        df["swing_low"]  = swing_lows
+        df["mss_bull"]   = mss_bull
+        df["mss_bear"]   = mss_bear
+        self.df = df
+
+    # ----------------------------------------------------------
+    # MÓDULO 6: EQUILIBRIUM / PREMIUM / DISCOUNT
+    # ----------------------------------------------------------
+
+    def calc_ranges(self):
+        """
+        Calcula el rango de la estructura actual y divide en:
+        - Premium (>50%): zona cara, vender
+        - Equilibrium (50%): zona neutra
+        - Discount (<50%): zona barata, comprar
+        """
+        df = self.df
+        n  = 50  # lookback para calcular el rango
+
+        df["range_high"] = df["high"].rolling(n).max()
+        df["range_low"]  = df["low"].rolling(n).min()
+        df["range_mid"]  = (df["range_high"] + df["range_low"]) / 2
+        df["range_pct"]  = (df["close"] - df["range_low"]) / (df["range_high"] - df["range_low"] + 1e-10)
+
+        df["in_discount"]   = df["range_pct"] < 0.45
+        df["in_equilibrium"]= (df["range_pct"] >= 0.45) & (df["range_pct"] <= 0.55)
+        df["in_premium"]    = df["range_pct"] > 0.55
+
+        self.df = df
+
+    # ----------------------------------------------------------
+    # SCORE DE CONFLUENCIA
+    # ----------------------------------------------------------
+
+    def calc_score(self) -> dict:
+        """
+        Calcula el score total de confluencia en la última vela.
+        Máximo: 13 puntos.
+
+        Distribución:
+          Order Flow  : 4 pts (CVD div +2, vol alto +1, absorción +1)
+          SMC         : 5 pts (en OB +2, FVG +1, nuevo OB +1, discount +1)
+          Stop Hunt   : 2 pts (+2 si hay barrida alcista)
+          MSS         : 2 pts (+2 si hay quiebre estructural alcista)
+        """
+        df   = self.df
+        last = df.iloc[-1]
+
+        s = {}
+
+        # --- Order Flow ---
+        s["cvd_div"]     = int(bool(last.get("cvd_div_bull",     False))) * 2
+        s["high_vol"]    = int(bool(last.get("high_vol",         False))) * 1
+        s["absorption"]  = int(bool(last.get("absorption_bull",  False))) * 1
+        s["score_of"]    = s["cvd_div"] + s["high_vol"] + s["absorption"]
+
+        # --- SMC ---
+        s["in_ob"]       = int(bool(last.get("in_bull_ob",      False))) * 2
+        s["in_fvg"]      = int(bool(last.get("in_fvg_bull",     False))) * 1
+        s["new_ob"]      = int(bool(last.get("new_bull_ob",     False))) * 1
+        s["discount"]    = int(bool(last.get("in_discount",     False))) * 1
+        s["score_smc"]   = s["in_ob"] + s["in_fvg"] + s["new_ob"] + s["discount"]
+
+        # --- Stop Hunt ---
+        s["sweep"]       = int(bool(last.get("stop_hunt_bull",  False))) * 2
+        s["score_sweep"] = s["sweep"]
+
+        # --- MSS / Entry ---
+        s["mss"]         = int(bool(last.get("mss_bull",        False))) * 2
+        s["score_entry"] = s["mss"]
+
+        # --- Total ---
+        s["total"]       = s["score_of"] + s["score_smc"] + s["score_sweep"] + s["score_entry"]
+        s["pct"]         = round(s["total"] / 13 * 100, 1)
+
+        # --- Precio actual ---
+        s["price"]        = round(float(last["close"]), 4)
+        s["range_pct"]    = round(float(last.get("range_pct", 0.5)) * 100, 1)
+        s["ob_bull_top"]  = last.get("ob_bull_top",  np.nan)
+        s["ob_bull_bot"]  = last.get("ob_bull_bottom", np.nan)
+
+        # --- Status ---
+        threshold = self.params.get("signal_threshold", 8)
+        warn      = self.params.get("warn_threshold",   6)
+
+        if s["total"] >= threshold:
+            s["status"] = "ENTRY"
+            s["emoji"]  = "🐋"
+            s["label"]  = "WHALE ENTRY"
+        elif s["total"] >= warn:
+            s["status"] = "SETUP"
+            s["emoji"]  = "⚡"
+            s["label"]  = "SETUP"
+        elif s["total"] >= 4:
+            s["status"] = "WATCH"
+            s["emoji"]  = "👀"
+            s["label"]  = "ZONA INTERÉS"
         else:
-            warn("Sin tickers configurados todavía")
+            s["status"] = "WAITING"
+            s["emoji"]  = "⏳"
+            s["label"]  = "ESPERANDO"
 
-        print(f"\n  Timeframe  : {C_BOLD}{session['timeframe']}{C_RESET}")
-        print(f"  Período    : {C_BOLD}{session['period']}{C_RESET}")
-        print(f"  Score señal: {C_BOLD}{session['signal_threshold']}/13{C_RESET}  {score_bar(session['signal_threshold'])}")
-        print(f"  Actualizar : cada {C_BOLD}{session['update_interval']}s{C_RESET}")
+        self.score   = s["total"]
+        self.status  = s["status"]
+        self.signals = s
+        return s
 
-        divider("Opciones")
-        print(f"""
-  {C_TITLE}1{C_RESET}  Agregar tickers (sugeridos o personalizados)
-  {C_TITLE}2{C_RESET}  Quitar tickers
-  {C_TITLE}3{C_RESET}  Cambiar timeframe
-  {C_TITLE}4{C_RESET}  Cambiar período de datos
-  {C_TITLE}5{C_RESET}  Ajustar parámetros del engine
-  {C_TITLE}6{C_RESET}  Ajustar alertas y dashboard
-  {C_TITLE}7{C_RESET}  Ver lista completa de tickers sugeridos
-  {C_OK}G{C_RESET}  💾 Guardar y generar config.py
-  {C_ERR}Q{C_RESET}  Salir
-""")
-        choice = input_prompt("Elegí una opción").upper()
+    # ----------------------------------------------------------
+    # MÉTODO PRINCIPAL: RUN
+    # ----------------------------------------------------------
 
-        if   choice == "1": menu_add_tickers()
-        elif choice == "2": menu_remove_tickers()
-        elif choice == "3": menu_timeframe()
-        elif choice == "4": menu_period()
-        elif choice == "5": menu_engine_params()
-        elif choice == "6": menu_alerts()
-        elif choice == "7": menu_browse_tickers()
-        elif choice == "G": save_config()
-        elif choice == "Q":
-            print(C_DIM + "\n  Hasta luego 🐋\n" + C_RESET)
-            sys.exit(0)
+    def run(self) -> dict | None:
+        """
+        Ejecuta el pipeline completo:
+        fetch → calcular todos los módulos → retornar signals.
+        Retorna None si falla la descarga.
+        """
+        if not self.fetch():
+            return None
 
-# =============================================================
-# MENÚ: AGREGAR TICKERS
-# =============================================================
-def menu_add_tickers():
-    while True:
-        clear()
-        header()
-        divider("Agregar tickers")
+        self.calc_cvd()
+        self.calc_order_blocks()
+        self.calc_fvg()
+        self.calc_stop_hunts()
+        self.calc_mss()
+        self.calc_ranges()
+        result = self.calc_score()
+        return result
 
-        slots = 10 - len(session["tickers"])
-        print(f"\n  Tenés {C_BOLD}{len(session['tickers'])}{C_RESET} ticker(s) · Podés agregar {C_WARN}{slots} más{C_RESET}")
+    # ----------------------------------------------------------
+    # HELPERS PARA EL DASHBOARD
+    # ----------------------------------------------------------
 
-        if session["tickers"]:
-            print(f"\n  Actuales: {C_OK}" + "  ".join(session["tickers"]) + C_RESET)
+    def get_ob_zones(self) -> list[dict]:
+        """Retorna los Order Blocks activos para dibujar en el gráfico."""
+        df     = self.df
+        zones  = []
+        seen   = set()
 
-        print(f"""
-  {C_TITLE}1{C_RESET}  Elegir de lista sugerida por categoría
-  {C_TITLE}2{C_RESET}  Escribir ticker manualmente
-  {C_TITLE}3{C_RESET}  Agregar todos los bancos ARG (GGAL BBAR BMA SUPV)
-  {C_TITLE}4{C_RESET}  Agregar pack energía ARG  (YPF PAM CEPU TGS)
-  {C_TITLE}V{C_RESET}  Volver al menú principal
-""")
-        choice = input_prompt("Opción").upper()
+        for i in range(len(df) - 1, max(len(df) - 200, 0), -1):
+            row = df.iloc[i]
 
-        if choice == "1":
-            add_from_list()
-        elif choice == "2":
-            add_manual()
-        elif choice == "3":
-            add_pack(["GGAL", "BBAR", "BMA", "SUPV"])
-        elif choice == "4":
-            add_pack(["YPF", "PAM", "CEPU", "TGS"])
-        elif choice == "V":
-            break
+            if row["new_bull_ob"] and not np.isnan(row["ob_bull_top"]):
+                key = round(row["ob_bull_top"], 4)
+                if key not in seen:
+                    seen.add(key)
+                    zones.append({
+                        "type":   "bull",
+                        "top":    row["ob_bull_top"],
+                        "bottom": row["ob_bull_bottom"],
+                        "time":   df.index[i],
+                    })
 
-def add_from_list():
-    clear()
-    header()
-    divider("Tickers sugeridos")
-    all_tickers = {}
-    idx = 1
-    for category, tickers in SUGGESTED.items():
-        print(f"\n  {C_HEADER}{category}{C_RESET}")
-        for ticker, name in tickers.items():
-            status = C_OK + "✓" if ticker in session["tickers"] else C_DIM + " "
-            print(f"  {status}{C_RESET} {C_TITLE}{idx:2}. {ticker:<8}{C_RESET} {C_DIM}{name}{C_RESET}")
-            all_tickers[str(idx)] = ticker
-            idx += 1
+            if row["new_bear_ob"] and not np.isnan(row["ob_bear_top"]):
+                key = round(row["ob_bear_top"], 4)
+                if key not in seen:
+                    seen.add(key)
+                    zones.append({
+                        "type":   "bear",
+                        "top":    row["ob_bear_top"],
+                        "bottom": row["ob_bear_bottom"],
+                        "time":   df.index[i],
+                    })
 
-    print(f"\n  {C_DIM}Escribí los números separados por coma. Ej: 1,3,5{C_RESET}")
-    raw = input_prompt("Números a agregar (o ENTER para cancelar)")
-    if not raw:
-        return
-    for n in raw.split(","):
-        t = all_tickers.get(n.strip())
-        if t:
-            add_ticker(t)
+            if len(zones) >= 6:
+                break
 
-def add_manual():
-    raw = input_prompt("Escribí el ticker (ej: GGAL, YPF, MELI — podés poner varios separados por coma)")
-    if not raw:
-        return
-    for t in raw.upper().replace(" ", "").split(","):
-        if t:
-            add_ticker(t)
-    wait()
+        return zones
 
-def add_pack(tickers):
-    for t in tickers:
-        add_ticker(t)
-    wait()
+    def get_fvg_zones(self) -> list[dict]:
+        """Retorna los FVGs activos para dibujar en el gráfico."""
+        df    = self.df
+        zones = []
+        seen  = set()
 
-def add_ticker(ticker):
-    ticker = ticker.upper().strip()
-    if len(session["tickers"]) >= 10:
-        warn(f"Límite de 10 tickers alcanzado. No se agregó {ticker}")
-        return
-    if ticker in session["tickers"]:
-        warn(f"{ticker} ya está en la lista")
-        return
-    session["tickers"].append(ticker)
-    ok(f"{ticker} agregado")
+        for i in range(len(df) - 1, max(len(df) - 200, 0), -1):
+            row = df.iloc[i]
 
-# =============================================================
-# MENÚ: QUITAR TICKERS
-# =============================================================
-def menu_remove_tickers():
-    if not session["tickers"]:
-        warn("No hay tickers para quitar")
-        wait()
-        return
+            if row["fvg_bull"] and not np.isnan(row["fvg_bull_top"]):
+                key = round(row["fvg_bull_top"], 4)
+                if key not in seen:
+                    seen.add(key)
+                    zones.append({
+                        "type":   "bull",
+                        "top":    row["fvg_bull_top"],
+                        "bottom": row["fvg_bull_bot"],
+                        "time":   df.index[i],
+                    })
 
-    clear()
-    header()
-    divider("Quitar tickers")
+            if row["fvg_bear"] and not np.isnan(row["fvg_bear_top"]):
+                key = round(row["fvg_bear_top"], 4)
+                if key not in seen:
+                    seen.add(key)
+                    zones.append({
+                        "type":   "bear",
+                        "top":    row["fvg_bear_top"],
+                        "bottom": row["fvg_bear_bot"],
+                        "time":   df.index[i],
+                    })
 
-    print()
-    for i, t in enumerate(session["tickers"], 1):
-        print(f"  {C_TITLE}{i}{C_RESET}. {t}")
+            if len(zones) >= 6:
+                break
 
-    print(f"\n  {C_WARN}T{C_RESET}  Quitar TODOS")
-    print(f"  {C_DIM}V{C_RESET}  Volver")
+        return zones
 
-    raw = input_prompt("Número(s) a quitar (ej: 1,3) o T para todos").upper()
+    def summary_line(self) -> str:
+        """Una línea de resumen para la consola."""
+        s = self.signals
+        if not s:
+            return f"{self.ticker:<8} {'—':>5}  ⏳ Sin datos"
 
-    if raw == "T":
-        session["tickers"] = []
-        ok("Lista vaciada")
-    elif raw and raw != "V":
-        to_remove = []
-        for n in raw.split(","):
-            try:
-                idx = int(n.strip()) - 1
-                if 0 <= idx < len(session["tickers"]):
-                    to_remove.append(session["tickers"][idx])
-            except ValueError:
-                pass
-        for t in to_remove:
-            session["tickers"].remove(t)
-            ok(f"{t} eliminado")
-    wait()
+        bar_len  = 12
+        filled   = int(s["total"] / 13 * bar_len)
+        bar      = "█" * filled + "░" * (bar_len - filled)
+
+        return (
+            f"{self.ticker:<8} "
+            f"{s['total']:>2}/13  "
+            f"[{bar}]  "
+            f"{s['emoji']} {s['label']:<16} "
+            f"${s['price']:.2f}  "
+            f"Range: {s['range_pct']:.0f}%"
+        )
+
 
 # =============================================================
-# MENÚ: TIMEFRAME
+# FUNCIÓN DE CONVENIENCIA: analizar un solo ticker
 # =============================================================
-def menu_timeframe():
-    clear()
-    header()
-    divider("Timeframe de análisis")
 
-    print(f"\n  Actual: {C_BOLD}{session['timeframe']}{C_RESET}\n")
-    for key, (tf, desc) in TIMEFRAMES.items():
-        marker = C_OK + "▶ " if tf == session["timeframe"] else "  "
-        print(f"  {marker}{C_TITLE}{key}{C_RESET}  {tf:<6} {C_DIM}{desc}{C_RESET}")
+def analyze(ticker: str, timeframe: str = "1h",
+            period: str = "3mo", params: dict = None) -> dict | None:
+    """
+    Función rápida para analizar un ticker desde la consola o Jupyter.
 
-    print()
-    info("Para SMC institucional, 1h es el timeframe más efectivo")
-    info("Scalping en 1m o 5m requiere reaccionar en segundos")
+    Uso:
+        from whale_engine import analyze
+        result = analyze("GGAL")
+        print(result)
+    """
+    if params is None:
+        params = {
+            "cvd_length": 20, "vol_length": 20, "vol_multiplier": 1.5,
+            "ob_length": 5, "ob_mitigation": 0.5, "fvg_min_pct": 0.2,
+            "sweep_lookback": 20, "sweep_wick_ratio": 2.0,
+            "swing_length": 5, "signal_threshold": 8, "warn_threshold": 6,
+        }
+    engine = WhaleEngine(ticker, timeframe, period, params)
+    return engine.run()
 
-    choice = input_prompt("Elegí (1-6) o ENTER para mantener actual")
-    if choice in TIMEFRAMES:
-        session["timeframe"] = TIMEFRAMES[choice][0]
-        ok(f"Timeframe configurado: {session['timeframe']}")
-        wait()
-
-# =============================================================
-# MENÚ: PERÍODO
-# =============================================================
-def menu_period():
-    clear()
-    header()
-    divider("Período de datos históricos")
-
-    print(f"\n  Actual: {C_BOLD}{session['period']}{C_RESET}\n")
-    for key, (p, desc) in PERIODS.items():
-        marker = C_OK + "▶ " if p == session["period"] else "  "
-        print(f"  {marker}{C_TITLE}{key}{C_RESET}  {p:<6} {C_DIM}{desc}{C_RESET}")
-
-    print()
-    info("Más datos = mejor cálculo de OBs y zonas. 3mo es el balance ideal.")
-
-    choice = input_prompt("Elegí (1-5) o ENTER para mantener actual")
-    if choice in PERIODS:
-        session["period"] = PERIODS[choice][0]
-        ok(f"Período configurado: {session['period']}")
-        wait()
 
 # =============================================================
-# MENÚ: PARÁMETROS DEL ENGINE
+# TEST RÁPIDO (correr directamente: python whale_engine.py)
 # =============================================================
-def menu_engine_params():
-    clear()
-    header()
-    divider("Parámetros del engine")
 
-    print(f"""
-  {C_DIM}Score mínimo para señal ACTIVA (actual: {C_BOLD}{session['signal_threshold']}/13{C_DIM}){C_RESET}
-  {C_DIM}  8/13 = equilibrio (recomendado){C_RESET}
-  {C_DIM}  6/13 = más señales, más falsas{C_RESET}
-  {C_DIM}  10/13 = muy selectivo, pocas señales pero de alta calidad{C_RESET}
-""")
-    raw = input_prompt(f"Score mínimo (6-12) [actual: {session['signal_threshold']}]")
-    try:
-        v = int(raw)
-        if 6 <= v <= 12:
-            session["signal_threshold"] = v
-            session["warn_threshold"]   = max(4, v - 2)
-            ok(f"Score mínimo: {v}/13  |  Advertencia: {session['warn_threshold']}/13")
-        else:
-            err("Valor fuera de rango (6-12)")
-    except ValueError:
-        info("Sin cambios")
-
-    print(f"""
-  {C_DIM}Intervalo de actualización (actual: cada {C_BOLD}{session['update_interval']}s{C_DIM}){C_RESET}
-  {C_DIM}  Mínimo recomendado: 60s (límite de yfinance){C_RESET}
-  {C_DIM}  30s funciona pero puede dar errores de rate limit{C_RESET}
-""")
-    raw = input_prompt(f"Segundos entre updates (30-300) [actual: {session['update_interval']}]")
-    try:
-        v = int(raw)
-        if 30 <= v <= 300:
-            session["update_interval"] = v
-            ok(f"Actualización cada {v}s")
-            if v < 60:
-                warn("Menos de 60s puede causar errores de rate limit con yfinance")
-        else:
-            err("Valor fuera de rango (30-300)")
-    except ValueError:
-        info("Sin cambios")
-
-    wait()
-
-# =============================================================
-# MENÚ: ALERTAS Y DASHBOARD
-# =============================================================
-def menu_alerts():
-    clear()
-    header()
-    divider("Alertas y dashboard")
-
-    print(f"""
-  {C_TITLE}1{C_RESET}  Sonido al detectar señal    [{C_OK + "ON" if session["sound"] else C_DIM + "OFF"}{C_RESET}]
-  {C_TITLE}2{C_RESET}  Guardar log en CSV          [{C_OK + "ON" if session["log_file"] else C_DIM + "OFF"}{C_RESET}]
-  {C_TITLE}3{C_RESET}  Puerto dashboard             [{C_BOLD}{session["dashboard_port"]}{C_RESET}]
-  {C_TITLE}4{C_RESET}  Velas en gráfico             [{C_BOLD}{session["dashboard_candles"]}{C_RESET}]
-  {C_DIM}V{C_RESET}  Volver
-""")
-    choice = input_prompt("Opción").upper()
-
-    if choice == "1":
-        session["sound"] = not session["sound"]
-        ok(f"Sonido {'activado' if session['sound'] else 'desactivado'}")
-    elif choice == "2":
-        session["log_file"] = not session["log_file"]
-        ok(f"Log CSV {'activado' if session['log_file'] else 'desactivado'}")
-    elif choice == "3":
-        raw = input_prompt("Puerto (ej: 8050)")
-        try:
-            session["dashboard_port"] = int(raw)
-            ok(f"Puerto: {session['dashboard_port']}")
-        except ValueError:
-            err("Puerto inválido")
-    elif choice == "4":
-        raw = input_prompt("Cantidad de velas (50-500)")
-        try:
-            v = int(raw)
-            if 50 <= v <= 500:
-                session["dashboard_candles"] = v
-                ok(f"Velas en gráfico: {v}")
-        except ValueError:
-            err("Valor inválido")
-
-    if choice != "V":
-        wait()
-
-# =============================================================
-# MENÚ: BROWSE TICKERS
-# =============================================================
-def menu_browse_tickers():
-    clear()
-    header()
-    divider("Todos los tickers sugeridos")
-    for category, tickers in SUGGESTED.items():
-        print(f"\n  {C_HEADER}{category}{C_RESET}")
-        for ticker, name in tickers.items():
-            status = C_OK + "  ✓ EN LISTA" if ticker in session["tickers"] else ""
-            print(f"    {C_TITLE}{ticker:<8}{C_RESET} {C_DIM}{name}{C_RESET}{status}")
-    print()
-    info("Para agregar cualquier otro ticker que no esté acá,")
-    info("usá la opción 'Escribir ticker manualmente' en el menú anterior.")
-    wait()
-
-# =============================================================
-# GUARDAR CONFIG.PY
-# =============================================================
-def save_config():
-    if not session["tickers"]:
-        err("Agregá al menos 1 ticker antes de guardar")
-        wait()
-        return
-
-    clear()
-    header()
-    divider("Guardando configuración")
-
-    # Serializar sesión para poder recargarla
-    session_json = json.dumps(session)
-
-    # Generar el contenido de config.py
-    tickers_str = "\n".join([f'    "{t}",' for t in session["tickers"]])
-    timestamp   = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
-    config_content = f'''# =============================================================
-# WHALE TRACKER — config.py
-# Generado automáticamente por setup_console.py
-# Última actualización: {timestamp}
-# NO editar manualmente — usar: python setup_console.py
-# =============================================================
-# WHALE_TRACKER_CONFIG_JSON
-# {session_json}
-
-TICKERS = [
-{tickers_str}
-]
-
-TIMEFRAME = "{session["timeframe"]}"
-
-PERIOD = "{session["period"]}"
-
-ENGINE = {{
-    "cvd_length":        20,
-    "vol_length":        20,
-    "vol_multiplier":    1.5,
-    "ob_length":         5,
-    "ob_mitigation":     0.5,
-    "fvg_min_pct":       0.2,
-    "sweep_lookback":    20,
-    "sweep_wick_ratio":  2.0,
-    "swing_length":      5,
-    "signal_threshold":  {session["signal_threshold"]},
-    "warn_threshold":    {session["warn_threshold"]},
-}}
-
-UPDATE_INTERVAL = {session["update_interval"]}
-
-ALERTS = {{
-    "sound":    {str(session["sound"])},
-    "console":  True,
-    "log_file": {str(session["log_file"])},
-}}
-
-DASHBOARD = {{
-    "auto_open":        True,
-    "port":             {session["dashboard_port"]},
-    "theme":            "dark",
-    "candles":          {session["dashboard_candles"]},
-}}
-'''
-
-    try:
-        with open("config.py", "w", encoding="utf-8") as f:
-            f.write(config_content)
-
-        print()
-        ok("config.py guardado exitosamente")
-        print()
-        print(f"  {C_BOLD}Resumen:{C_RESET}")
-        print(f"  Tickers   : {C_OK}{', '.join(session['tickers'])}{C_RESET}")
-        print(f"  Timeframe : {C_BOLD}{session['timeframe']}{C_RESET}")
-        print(f"  Período   : {C_BOLD}{session['period']}{C_RESET}")
-        print(f"  Señal en  : {C_BOLD}{session['signal_threshold']}/13 puntos{C_RESET}")
-        print()
-        info("Próximo paso: correr main.py para iniciar el tracker")
-        info("  python main.py")
-        print()
-
-    except Exception as e:
-        err(f"Error al guardar: {e}")
-
-    wait()
-
-# =============================================================
-# PUNTO DE ENTRADA
-# =============================================================
 if __name__ == "__main__":
-    clear()
-    # Intentar cargar config existente
-    if load_existing():
-        print(C_OK + "\n  ✓ Configuración anterior cargada" + C_RESET)
-        import time
-        time.sleep(1)
-    main_menu()
+    import sys
+
+    ticker = sys.argv[1] if len(sys.argv) > 1 else "GGAL"
+    print(f"\n🐋 Whale Engine — test rápido: {ticker}\n")
+
+    result = analyze(ticker)
+
+    if result:
+        print(f"  Precio       : ${result['price']}")
+        print(f"  Score total  : {result['total']}/13  ({result['pct']}%)")
+        print(f"  Status       : {result['emoji']} {result['label']}")
+        print(f"  Range pos.   : {result['range_pct']}%")
+        print(f"\n  Detalle:")
+        print(f"    Order Flow : {result['score_of']}/4"
+              f"  (CVD:{result['cvd_div']} Vol:{result['high_vol']} Abs:{result['absorption']})")
+        print(f"    SMC        : {result['score_smc']}/5"
+              f"  (OB:{result['in_ob']} FVG:{result['in_fvg']} Disc:{result['discount']})")
+        print(f"    Stop Hunt  : {result['score_sweep']}/2")
+        print(f"    MSS Entry  : {result['score_entry']}/2")
+    else:
+        print("  Error al descargar datos. Verificá el ticker y la conexión.")
